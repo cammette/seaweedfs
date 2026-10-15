@@ -35,6 +35,8 @@ var Commands = []*Command{
 	cmdImage,
 	cmdMaster,
 	cmdMasterFollower,
+	cmdMigrateVolume,
+	cmdMigrateVolumeStatus,
 	cmdMini,
 	cmdMount,
 	cmdMqAgent,

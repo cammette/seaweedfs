@@ -1,0 +1,9 @@
+# Minimal filer store for local migrate tests (leveldb2).
+# Loaded from this directory when start.sh runs (cwd = test-env).
+
+[filer.options]
+recursive_delete = true
+
+[leveldb2]
+enabled = true
+dir = "./data/filerldb2"
