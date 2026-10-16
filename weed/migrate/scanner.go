@@ -29,6 +29,7 @@ type NeedleRecord struct {
 	Mime        string
 	Compressed  bool
 	Data        []byte // payload to upload (optionally decompressed)
+	Checksum    uint32 // CRC32-Castagnoli of Data; matches volume needle ETag
 }
 
 // IdxEntryCount returns number of index rows in .idx.
@@ -128,6 +129,9 @@ func ScanVolume(ref VolumeRef, fromIdxEntry uint64, newerThan time.Time, hasNewe
 			rec.Compressed = false
 		}
 		rec.DataSize = int64(len(rec.Data))
+		// CRC of the bytes that will be written. Destination needle ETag is this value.
+		// When the payload is not decompressed it equals the source needle checksum.
+		rec.Checksum = uint32(needle.NewCRC(rec.Data))
 		return visit(idxPos, rec)
 	})
 	if err != nil && err != io.EOF {

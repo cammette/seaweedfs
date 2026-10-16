@@ -1,4 +1,14 @@
 /data/
+/a/data/
+/a/*.log
+/a/*.pid
+/b/data/
+/migrate-state/
+/file_migrate/state/
+/blob_migrate/state/
+/blob_sync/state/
+/blob_sync/inserted.list
 /*.log
 /*.pid
 /weed
+

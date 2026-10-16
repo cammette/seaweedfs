@@ -42,13 +42,13 @@ type VolumeProgress struct {
 }
 
 type FailRecord struct {
-	TS     string `json:"ts"`
-	VID    uint32 `json:"vid"`
-	FID    string `json:"fid"`
-	Path   string `json:"path"`
-	Stage  string `json:"stage"`
-	Err    string `json:"err"`
-	Retry  int    `json:"retries"`
+	TS    string `json:"ts"`
+	VID   uint32 `json:"vid"`
+	FID   string `json:"fid"`
+	Path  string `json:"path"`
+	Stage string `json:"stage"`
+	Err   string `json:"err"`
+	Retry int    `json:"retries"`
 }
 
 // ProgressStore persists migration checkpoints under stateDir.
@@ -89,7 +89,7 @@ func (ps *ProgressStore) Close() error {
 	return first
 }
 
-func (ps *ProgressStore) jobPath() string     { return filepath.Join(ps.dir, "job.json") }
+func (ps *ProgressStore) jobPath() string { return filepath.Join(ps.dir, "job.json") }
 func (ps *ProgressStore) volumePath(vid uint32) string {
 	return filepath.Join(ps.dir, "volumes", fmt.Sprintf("%d.json", vid))
 }
@@ -105,11 +105,17 @@ func (ps *ProgressStore) skippedPath() string {
 }
 
 func configFingerprint(cfg Config) map[string]string {
+	mode := cfg.Mode
+	if mode == "" {
+		mode = "filer"
+	}
 	return map[string]string{
 		"dir":           cfg.Dir,
 		"collection":    cfg.Collection,
 		"filer":         cfg.Filer,
 		"path_template": cfg.PathTemplate,
+		"mode":          mode,
+		"masters":       cfg.Masters,
 	}
 }
 
@@ -138,10 +144,20 @@ func (ps *ProgressStore) LoadOrInit(cfg Config) error {
 		return fmt.Errorf("parse job.json: %w", err)
 	}
 	if !cfg.ForceConfig {
-		for _, k := range []string{"dir", "collection", "filer", "path_template"} {
-			if ps.job.Config[k] != fp[k] {
+		keys := []string{"dir", "collection"}
+		if fp["mode"] == "blob" || ps.job.Config["mode"] == "blob" {
+			keys = append(keys, "mode", "masters")
+		} else {
+			keys = append(keys, "filer", "path_template")
+		}
+		for _, k := range keys {
+			stored := ps.job.Config[k]
+			if k == "mode" && stored == "" {
+				stored = "filer"
+			}
+			if stored != fp[k] {
 				return fmt.Errorf("stateDir config mismatch on %s: stored=%q current=%q (use -force to override)",
-					k, ps.job.Config[k], fp[k])
+					k, stored, fp[k])
 			}
 		}
 	} else {
@@ -243,6 +259,28 @@ func (ps *ProgressStore) MarkSuccess(vid uint32, fidSafe string) error {
 	return nil
 }
 
+// LoadSuccessFIDs reads success/{vid}.log without opening a write handle.
+func LoadSuccessFIDs(stateDir string, vid uint32) (map[string]struct{}, error) {
+	path := filepath.Join(stateDir, "success", fmt.Sprintf("%d.log", vid))
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]struct{}{}, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	set := map[string]struct{}{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line != "" {
+			set[line] = struct{}{}
+		}
+	}
+	return set, sc.Err()
+}
+
 func (ps *ProgressStore) SuccessCount(vid uint32) (int64, error) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -309,32 +347,32 @@ func (ps *ProgressStore) writeJSONLocked(path string, v interface{}) error {
 
 // MetricsSnapshot is flushed to metrics.json for monitoring.
 type MetricsSnapshot struct {
-	UpdatedAt       string   `json:"updated_at"`
-	Phase           string   `json:"phase"`
-	VolumesTotal    int      `json:"volumes_total"`
-	VolumesDone     int      `json:"volumes_done"`
-	VolumesRunning  []uint32 `json:"volumes_running"`
-	FilesScanned    int64    `json:"files_scanned"`
-	FilesUploaded   int64    `json:"files_uploaded"`
-	FilesSkipped    int64    `json:"files_skipped"`
-	FilesFailed     int64    `json:"files_failed"`
-	FilesVerified   int64    `json:"files_verified"`
-	BytesUploaded   int64    `json:"bytes_uploaded"`
-	BytesPerSec     float64  `json:"bytes_per_sec"`
-	FilesPerSec     float64  `json:"files_per_sec"`
+	UpdatedAt      string   `json:"updated_at"`
+	Phase          string   `json:"phase"`
+	VolumesTotal   int      `json:"volumes_total"`
+	VolumesDone    int      `json:"volumes_done"`
+	VolumesRunning []uint32 `json:"volumes_running"`
+	FilesScanned   int64    `json:"files_scanned"`
+	FilesUploaded  int64    `json:"files_uploaded"`
+	FilesSkipped   int64    `json:"files_skipped"`
+	FilesFailed    int64    `json:"files_failed"`
+	FilesVerified  int64    `json:"files_verified"`
+	BytesUploaded  int64    `json:"bytes_uploaded"`
+	BytesPerSec    float64  `json:"bytes_per_sec"`
+	FilesPerSec    float64  `json:"files_per_sec"`
 }
 
 // StatusReport is produced by migrate.volume.status.
 type StatusReport struct {
-	StateDir           string              `json:"state_dir"`
-	Config             map[string]string   `json:"config,omitempty"`
-	VolumesTotal       int                 `json:"volumes_total"`
-	VolumesDone        int                 `json:"volumes_done"`
-	VolumesRunning     int                 `json:"volumes_running"`
-	VolumesPending     int                 `json:"volumes_pending"`
-	FIDsMigratedTotal  int64               `json:"fids_migrated_total"`
-	Failed             int64               `json:"failed"`
-	Volumes            []VolumeStatusRow   `json:"volumes"`
+	StateDir          string            `json:"state_dir"`
+	Config            map[string]string `json:"config,omitempty"`
+	VolumesTotal      int               `json:"volumes_total"`
+	VolumesDone       int               `json:"volumes_done"`
+	VolumesRunning    int               `json:"volumes_running"`
+	VolumesPending    int               `json:"volumes_pending"`
+	FIDsMigratedTotal int64             `json:"fids_migrated_total"`
+	Failed            int64             `json:"failed"`
+	Volumes           []VolumeStatusRow `json:"volumes"`
 }
 
 type VolumeStatusRow struct {
@@ -425,9 +463,18 @@ func FormatStatusText(rep *StatusReport) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "StateDir: %s\n", rep.StateDir)
 	if rep.Config != nil {
-		fmt.Fprintf(&b, "Filer: %s\n", rep.Config["filer"])
+		mode := rep.Config["mode"]
+		if mode == "" {
+			mode = "filer"
+		}
+		fmt.Fprintf(&b, "Mode: %s\n", mode)
 		fmt.Fprintf(&b, "Collection: %s\n", rep.Config["collection"])
-		fmt.Fprintf(&b, "Path: %s\n", rep.Config["path_template"])
+		if mode == "blob" {
+			fmt.Fprintf(&b, "Masters: %s\n", rep.Config["masters"])
+		} else {
+			fmt.Fprintf(&b, "Filer: %s\n", rep.Config["filer"])
+			fmt.Fprintf(&b, "Path: %s\n", rep.Config["path_template"])
+		}
 	}
 	fmt.Fprintf(&b, "\nVolumes: %d done / %d running / %d pending  (total %d)\n",
 		rep.VolumesDone, rep.VolumesRunning, rep.VolumesPending, rep.VolumesTotal)

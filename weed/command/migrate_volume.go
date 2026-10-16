@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/migrate"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -20,10 +21,17 @@ var cmdMigrateVolume = &Command{
 	Long: `Migrate live needles from local volume .dat/.idx files to a target Filer over HTTP.
 
   Reads the volume directory on a volume server, resumes from local stateDir,
-  uploads each file to a path rendered from -path template (filename is source fid),
-  and optionally verifies existence and Content-Length (meta).
+  uploads each file to a path rendered from -path template (filename is source fid).
 
-  Progress can be inspected with: weed migrate.volume.status -stateDir=...
+  -verifyMode controls post-upload checks: none | exists | size(meta) | crc | md5.
+  crc (blob default when -verifyMode is empty) compares the needle CRC32 via the volume ETag.
+
+  -mode=filer writes through the filer (a new fid is assigned).
+  -mode=blob talks only to target masters and volume servers and keeps the source fid.
+  Missing volumes are created with that volume id, then the needle is POSTed to the volume.
+
+  Progress: weed migrate.volume.status -stateDir=...
+  Offline compare: weed migrate.volume.verify ...
 
 `,
 }
@@ -37,9 +45,11 @@ var (
 	mvStateDir      = cmdMigrateVolume.Flag.String("stateDir", "", "local directory for migration progress")
 	mvDecompress    = cmdMigrateVolume.Flag.Bool("decompress", true, "decompress gzip needles before upload")
 	mvDryRun        = cmdMigrateVolume.Flag.Bool("dryRun", false, "print destinations without uploading")
-	mvVerifyMeta    = cmdMigrateVolume.Flag.Bool("verifyMeta", true, "after upload, verify target exists and size matches")
+	mvVerifyMode    = cmdMigrateVolume.Flag.String("verifyMode", "", "post-upload verify: none|exists|size|crc|md5; empty = size (filer) or crc (blob)")
+	mvVerifyMeta    = cmdMigrateVolume.Flag.Bool("verifyMeta", true, "deprecated: if -verifyMode unset semantics, true=>size false=>none")
 	mvRetries       = cmdMigrateVolume.Flag.Int("retries", 3, "upload retries on failure")
 	mvLimit         = cmdMigrateVolume.Flag.Int("limit", 0, "stop after N successful migrations (0=unlimited)")
+	mvWorkers       = cmdMigrateVolume.Flag.Int("workers", 4, "concurrent uploads within a volume")
 	mvNewer         = cmdMigrateVolume.Flag.String("newer", "", "only migrate LastModified after this time (2006-01-02T15:04:05)")
 	mvTimeZone      = cmdMigrateVolume.Flag.String("timeZone", "Local", "timezone for path date vars: Local or UTC")
 	mvCollectionDst = cmdMigrateVolume.Flag.String("collectionDst", "", "optional target collection query param")
@@ -47,6 +57,8 @@ var (
 	mvTTL           = cmdMigrateVolume.Flag.String("ttl", "", "optional ttl query param")
 	mvDisk          = cmdMigrateVolume.Flag.String("disk", "", "optional disk query param")
 	mvForce         = cmdMigrateVolume.Flag.Bool("force", false, "allow continuing when stateDir config fingerprint differs")
+	mvMode          = cmdMigrateVolume.Flag.String("mode", "filer", "filer: write via filer HTTP (new fid); blob: master+volume, keep source fid")
+	mvMasters       = cmdMigrateVolume.Flag.String("masters", "", "target master addresses host:port, comma-separated; required for -mode=blob")
 )
 
 func runMigrateVolume(cmd *Command, args []string) bool {
@@ -54,6 +66,20 @@ func runMigrateVolume(cmd *Command, args []string) bool {
 
 	*mvDir = util.ResolvePath(*mvDir)
 	*mvStateDir = util.ResolvePath(*mvStateDir)
+
+	level, err := migrate.ParseVerifyLevel(*mvVerifyMode)
+	if err != nil {
+		fmt.Printf("invalid -verifyMode: %v\n", err)
+		return false
+	}
+	// Empty -verifyMode: filer checks size, blob checks the needle CRC (volume ETag).
+	if strings.TrimSpace(*mvVerifyMode) == "" && strings.EqualFold(*mvMode, "blob") {
+		level = migrate.VerifyCRC
+	}
+	// Honor deprecated -verifyMeta only when user left verifyMode at the filer default and set verifyMeta=false.
+	if !*mvVerifyMeta && (strings.TrimSpace(*mvVerifyMode) == "" || *mvVerifyMode == "size") && !strings.EqualFold(*mvMode, "blob") {
+		level = migrate.VerifyNone
+	}
 
 	cfg := migrate.Config{
 		Dir:           *mvDir,
@@ -63,14 +89,18 @@ func runMigrateVolume(cmd *Command, args []string) bool {
 		StateDir:      *mvStateDir,
 		Decompress:    *mvDecompress,
 		DryRun:        *mvDryRun,
-		VerifyMeta:    *mvVerifyMeta,
+		VerifyMode:    level,
 		Retries:       *mvRetries,
 		Limit:         *mvLimit,
+		Workers:       *mvWorkers,
 		CollectionDst: *mvCollectionDst,
 		Replication:   *mvReplication,
 		TTL:           *mvTTL,
 		Disk:          *mvDisk,
 		ForceConfig:   *mvForce,
+		Mode:          *mvMode,
+		Masters:       *mvMasters,
+		GrpcDial:      security.LoadClientTLS(util.GetViper(), "grpc.client"),
 	}
 
 	if *mvVolumeIds != "" {

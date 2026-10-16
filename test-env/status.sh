@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-PID_FILE="$ROOT/weed.pid"
 
-if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "process: running pid=$(cat "$PID_FILE")"
-else
-  echo "process: not running"
-fi
-
-for name_url in "master:http://127.0.0.1:9333/cluster/status" "volume:http://127.0.0.1:8080/status" "filer:http://127.0.0.1:8888/"; do
-  name="${name_url%%:*}"
-  url="${name_url#*:}"
-  if curl -sf -o /dev/null "$url"; then
-    echo "$name: ok ($url)"
+check() {
+  local name="$1" pid_file="$2" master="$3" volume="$4" filer="$5"
+  echo "== cluster $name =="
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    echo "process: running pid=$(cat "$pid_file")"
   else
-    echo "$name: down ($url)"
+    echo "process: not running"
   fi
-done
+  for item in "master:http://127.0.0.1:${master}/cluster/status" "volume:http://127.0.0.1:${volume}/status" "filer:http://127.0.0.1:${filer}/"; do
+    local label="${item%%:*}"
+    local url="${item#*:}"
+    if curl -sf -o /dev/null "$url"; then
+      echo "$label: ok ($url)"
+    else
+      echo "$label: down ($url)"
+    fi
+  done
+}
+
+check a "$ROOT/a/weed.pid" 9333 8080 8888
+check b "$ROOT/b/weed.pid" 9334 8081 9888

@@ -1,0 +1,77 @@
+# =============================================================================
+# 单节点 test-env：源卷 src_demo_*  →  Filer /dst_demo/...（写入 dst_demo_* 卷）
+# =============================================================================
+#
+# 前置（在 test-env 目录）：
+#   ./start.sh                 # 集群未启动时
+#   ./prepare_demo_data.sh     # 已灌过源数据可跳过
+#   确保有 ./weed：  (cd .. && go build -o test-env/weed ./weed)
+#
+# 源：读 ./a/data/volume 下 collection=src_demo 的卷文件（内含 fid）
+# 目标：同一 Filer http://127.0.0.1:8888 ，目录 /dst_demo/...
+#       -collectionDst=dst_demo → 新数据进 dst_demo_* 卷，与源 src_demo_* 分离
+# =============================================================================
+
+cd /ex-bingo/github/seaweedfs/test-env
+
+# ---------- 1) 迁移 ----------
+./weed migrate.volume \
+  -dir=./a/data/volume \
+  -collection=src_demo \
+  -filer=http://127.0.0.1:8888 \
+  -path='/dst_demo/{yyyy}/{yyyyMMdd}/{volume_id}/{hash12}/{fid}' \
+  -collectionDst=dst_demo \
+  -stateDir=./migrate-state/src_demo \
+  -verifyMode=md5 \
+  -workers=4 \
+  -decompress=true
+
+# 也可只迁部分卷，例如：
+# ./weed migrate.volume ... -volumeIds=9,11,12,13
+
+# ---------- 2) 看进度 ----------
+./weed migrate.volume.status -stateDir=./migrate-state/src_demo
+
+# ---------- 3) 离线 MD5 检验 ----------
+./weed migrate.volume.verify \
+  -dir=./a/data/volume \
+  -collection=src_demo \
+  -filer=http://127.0.0.1:8888 \
+  -path='/dst_demo/{yyyy}/{yyyyMMdd}/{volume_id}/{hash12}/{fid}' \
+  -level=md5 \
+  -onlySuccess \
+  -stateDir=./migrate-state/src_demo \
+  -report=./migrate-state/verify_report.json \
+  -decompress=true
+
+# ---------- 4) 确认目标卷与源卷不是同一批文件 ----------
+ls a/data/volume/src_demo_*.dat
+ls a/data/volume/dst_demo_*.dat
+
+# ---------- 5) 停集群（可选）----------
+# ./stop.sh a
+# ./stop.sh b
+
+# =============================================================================
+# blob 模式：集群 A 的卷 -> 集群 B 的 master/volume，保留源 fid
+# =============================================================================
+# 集群 A: master 9333  volume 8080  filer 8888   数据 ./a/data/volume
+# 集群 B: master 9334  volume 8081  filer 9888   数据 ./b/data/volume
+#
+# ./start.sh a
+# ./start.sh b
+
+./weed migrate.volume \
+  -mode=blob \
+  -masters=127.0.0.1:9334 \
+  -dir=./a/data/volume \
+  -collection=src_demo \
+  -collectionDst=src_demo \
+  -replication=000 \
+  -stateDir=./migrate-state/blob-a-to-b \
+  -verifyMode=md5 \
+  -workers=2 \
+  -decompress=true
+
+# 迁完后集群 B 上应出现与源相同的 volumeId 文件，例如 src_demo_9.dat
+# ls ./b/data/volume/src_demo_*.dat

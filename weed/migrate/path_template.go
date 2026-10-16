@@ -22,12 +22,12 @@ var (
 
 // PathContext feeds path template rendering.
 type PathContext struct {
-	Fid          string // raw "3,abc..."
-	FidPathSafe  string // "3_abc..."
-	VolumeID     uint32
-	Collection   string
-	Modified     time.Time
-	TimeZone     *time.Location
+	Fid         string // raw "3,abc..."
+	FidPathSafe string // "3_abc..."
+	VolumeID    uint32
+	Collection  string
+	Modified    time.Time
+	TimeZone    *time.Location
 }
 
 // PathTemplate renders destination paths.

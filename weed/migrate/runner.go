@@ -4,21 +4,36 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
-// Run executes a volume→filer migration job (P0: serial volumes).
+type migrateJob struct {
+	idxPos uint64
+	rec    *NeedleRecord // nil = idx-only (advance cursor, no upload)
+}
+
+// Run executes a volume→filer migration job.
 func Run(cfg Config) error {
 	if err := cfg.Normalize(); err != nil {
 		return err
 	}
+	if cfg.VerifyMode == VerifyCRC && !cfg.IsBlob() {
+		return fmt.Errorf("verifyMode=crc compares needle checksums and requires -mode=blob")
+	}
 
-	tmpl, err := NewPathTemplate(cfg.PathTemplate)
-	if err != nil {
-		return err
+	var (
+		tmpl *PathTemplate
+		err  error
+	)
+	if !cfg.IsBlob() {
+		tmpl, err = NewPathTemplate(cfg.PathTemplate)
+		if err != nil {
+			return err
+		}
 	}
 
 	store, err := OpenProgressStore(cfg.StateDir)
@@ -45,7 +60,12 @@ func Run(cfg Config) error {
 		return fmt.Errorf("no volumes found under %s collection=%q", cfg.Dir, cfg.Collection)
 	}
 
-	filer := NewFilerHTTP(cfg.FilerBases(), cfg.CollectionDst, cfg.Replication, cfg.TTL, cfg.Disk)
+	var dst destIO
+	if cfg.IsBlob() {
+		dst = blobDest{NewBlobClient(cfg)}
+	} else {
+		dst = filerDest{NewFilerHTTP(cfg.FilerBases(), cfg.CollectionDst, cfg.Replication, cfg.TTL, cfg.Disk)}
+	}
 
 	var (
 		uploaded atomic.Int64
@@ -57,6 +77,7 @@ func Run(cfg Config) error {
 	)
 	start := time.Now()
 	doneVolumes := 0
+	var migratedLimit atomic.Int64
 
 	flushMetrics := func(phase string, running []uint32) {
 		elapsed := time.Since(start).Seconds()
@@ -97,7 +118,6 @@ func Run(cfg Config) error {
 	}()
 	defer close(stopPrint)
 
-	var migratedLimit int
 	for _, ref := range refs {
 		vp, err := store.GetVolume(uint32(ref.VolumeID))
 		if err != nil {
@@ -107,7 +127,7 @@ func Run(cfg Config) error {
 			doneVolumes++
 			continue
 		}
-		if cfg.Limit > 0 && migratedLimit >= cfg.Limit {
+		if cfg.Limit > 0 && migratedLimit.Load() >= int64(cfg.Limit) {
 			break
 		}
 
@@ -122,136 +142,16 @@ func Run(cfg Config) error {
 			return err
 		}
 		flushMetrics("migrate", []uint32{uint32(ref.VolumeID)})
-		fmt.Fprintf(os.Stderr, "migrating volume %d (%d idx entries, cursor=%d)\n",
-			ref.VolumeID, entries, vp.IdxCursor)
+		fmt.Fprintf(os.Stderr, "migrating volume %d (%d idx entries, cursor=%d, workers=%d, verify=%s)\n",
+			ref.VolumeID, entries, vp.IdxCursor, cfg.Workers, cfg.VerifyMode)
 
-		processedSinceFlush := 0
-		err = ScanVolume(ref, vp.IdxCursor, cfg.Newer, cfg.HasNewer, cfg.Decompress,
-			func(idxPos uint64, rec *NeedleRecord) error {
-				scanned.Add(1)
-				vp.IdxCursor = idxPos + 1
-				processedSinceFlush++
-
-				defer func() {
-					if processedSinceFlush >= cfg.ProgressEvery {
-						_ = store.SaveVolume(vp)
-						processedSinceFlush = 0
-					}
-				}()
-
-				if rec == nil {
-					return nil
-				}
-				if cfg.Limit > 0 && migratedLimit >= cfg.Limit {
-					return ioEOF
-				}
-
-				ok, err := store.HasSuccess(uint32(ref.VolumeID), rec.FidPathSafe)
-				if err != nil {
-					return err
-				}
-				if ok {
-					skippedN.Add(1)
-					vp.Skipped++
-					return nil
-				}
-
-				dest, err := tmpl.Render(PathContext{
-					Fid:         rec.Fid,
-					FidPathSafe: rec.FidPathSafe,
-					VolumeID:    uint32(ref.VolumeID),
-					Collection:  cfg.Collection,
-					Modified:    rec.Modified,
-					TimeZone:    cfg.TimeZone,
-				})
-				if err != nil {
-					failed.Add(1)
-					vp.Failed++
-					_ = store.MarkFailed(FailRecord{
-						VID: uint32(ref.VolumeID), FID: rec.FidPathSafe, Path: "", Stage: "path", Err: err.Error(),
-					})
-					return nil
-				}
-
-				if cfg.DryRun {
-					fmt.Printf("DRY-RUN vid=%d fid=%s -> %s size=%d\n", ref.VolumeID, rec.FidPathSafe, dest, rec.DataSize)
-					if err := store.MarkSuccess(uint32(ref.VolumeID), rec.FidPathSafe); err != nil {
-						return err
-					}
-					uploaded.Add(1)
-					migratedLimit++
-					vp.Uploaded++
-					vp.LastFID = rec.FidPathSafe
-					return nil
-				}
-
-				ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout(rec.DataSize))
-				exists, remoteSize, err := filer.Exists(ctx, dest)
-				cancel()
-				if err != nil {
-					glog.V(1).Infof("exists check %s: %v", dest, err)
-				} else if exists {
-					if !cfg.VerifyMeta || remoteSize < 0 || remoteSize == rec.DataSize {
-						if err := store.MarkSuccess(uint32(ref.VolumeID), rec.FidPathSafe); err != nil {
-							return err
-						}
-						skippedN.Add(1)
-						verified.Add(1)
-						vp.Skipped++
-						vp.LastFID = rec.FidPathSafe
-						return nil
-					}
-					// size mismatch: re-upload
-				}
-
-				ctx, cancel = context.WithTimeout(context.Background(), uploadTimeout(rec.DataSize))
-				err = filer.UploadWithRetry(ctx, dest, rec.Data, rec.Mime, cfg.Retries)
-				cancel()
-				if err != nil {
-					failed.Add(1)
-					vp.Failed++
-					_ = store.MarkFailed(FailRecord{
-						VID: uint32(ref.VolumeID), FID: rec.FidPathSafe, Path: dest, Stage: "upload",
-						Err: err.Error(), Retry: cfg.Retries,
-					})
-					return nil
-				}
-
-				if cfg.VerifyMeta {
-					ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-					okExists, gotSize, verr := filer.Exists(ctx, dest)
-					cancel()
-					if verr != nil || !okExists || (gotSize >= 0 && gotSize != rec.DataSize) {
-						msg := fmt.Sprintf("verify meta failed exists=%v size=%d want=%d err=%v", okExists, gotSize, rec.DataSize, verr)
-						failed.Add(1)
-						vp.Failed++
-						_ = store.MarkFailed(FailRecord{
-							VID: uint32(ref.VolumeID), FID: rec.FidPathSafe, Path: dest, Stage: "verify", Err: msg,
-						})
-						return nil
-					}
-					verified.Add(1)
-				}
-
-				if err := store.MarkSuccess(uint32(ref.VolumeID), rec.FidPathSafe); err != nil {
-					return err
-				}
-				uploaded.Add(1)
-				bytesUp.Add(rec.DataSize)
-				migratedLimit++
-				vp.Uploaded++
-				vp.Bytes += rec.DataSize
-				vp.LastFID = rec.FidPathSafe
-				glog.V(1).Infof("migrated %s -> %s (%d bytes)", rec.FidPathSafe, dest, rec.DataSize)
-				return nil
-			})
-
-		if err != nil && err != ioEOF {
+		if err := migrateOneVolume(cfg, store, dst, tmpl, ref, &vp,
+			&uploaded, &skippedN, &failed, &bytesUp, &scanned, &verified, &migratedLimit); err != nil {
 			_ = store.SaveVolume(vp)
-			return fmt.Errorf("scan volume %d: %w", ref.VolumeID, err)
+			return err
 		}
 
-		if cfg.Limit > 0 && migratedLimit >= cfg.Limit {
+		if cfg.Limit > 0 && migratedLimit.Load() >= int64(cfg.Limit) {
 			_ = store.SaveVolume(vp)
 			fmt.Fprintf(os.Stderr, "reached -limit=%d, stopping\n", cfg.Limit)
 			break
@@ -283,10 +183,330 @@ func Run(cfg Config) error {
 	return nil
 }
 
+func migrateOneVolume(
+	cfg Config,
+	store *ProgressStore,
+	dst destIO,
+	tmpl *PathTemplate,
+	ref VolumeRef,
+	vp *VolumeProgress,
+	uploaded, skippedN, failed, bytesUp, scanned, verified, migratedLimit *atomic.Int64,
+) error {
+	if err := dst.PrepareVolume(context.Background(), uint32(ref.VolumeID)); err != nil {
+		return fmt.Errorf("prepare volume %d: %w", ref.VolumeID, err)
+	}
+	jobs := make(chan migrateJob, cfg.Workers*2)
+	doneIdx := make(chan uint64, cfg.Workers*2)
+
+	var (
+		wg       sync.WaitGroup
+		vpMu     sync.Mutex
+		scanErr  error
+		stopScan atomic.Bool
+	)
+
+	// Cursor committer: advance IdxCursor only over a contiguous completed prefix.
+	commitDone := make(chan struct{})
+	go func() {
+		defer close(commitDone)
+		next := vp.IdxCursor
+		completed := map[uint64]struct{}{}
+		sinceFlush := 0
+		for idxPos := range doneIdx {
+			completed[idxPos] = struct{}{}
+			for {
+				if _, ok := completed[next]; !ok {
+					break
+				}
+				delete(completed, next)
+				next++
+				sinceFlush++
+				vpMu.Lock()
+				vp.IdxCursor = next
+				vpMu.Unlock()
+				if sinceFlush >= cfg.ProgressEvery {
+					vpMu.Lock()
+					_ = store.SaveVolume(*vp)
+					vpMu.Unlock()
+					sinceFlush = 0
+				}
+			}
+		}
+		vpMu.Lock()
+		vp.IdxCursor = next
+		_ = store.SaveVolume(*vp)
+		vpMu.Unlock()
+	}()
+
+	process := func(job migrateJob) {
+		defer func() { doneIdx <- job.idxPos }()
+		scanned.Add(1)
+		if job.rec == nil {
+			return
+		}
+		if cfg.Limit > 0 && migratedLimit.Load() >= int64(cfg.Limit) {
+			stopScan.Store(true)
+			return
+		}
+
+		vid := uint32(ref.VolumeID)
+		ok, err := store.HasSuccess(vid, job.rec.FidPathSafe)
+		if err != nil {
+			failed.Add(1)
+			_ = store.MarkFailed(FailRecord{VID: vid, FID: job.rec.FidPathSafe, Stage: "state", Err: err.Error()})
+			return
+		}
+		if ok {
+			skippedN.Add(1)
+			vpMu.Lock()
+			vp.Skipped++
+			vpMu.Unlock()
+			return
+		}
+
+		var dest string
+		if cfg.IsBlob() {
+			dest = job.rec.Fid
+		} else {
+			var err error
+			dest, err = tmpl.Render(PathContext{
+				Fid:         job.rec.Fid,
+				FidPathSafe: job.rec.FidPathSafe,
+				VolumeID:    vid,
+				Collection:  cfg.Collection,
+				Modified:    job.rec.Modified,
+				TimeZone:    cfg.TimeZone,
+			})
+			if err != nil {
+				failed.Add(1)
+				vpMu.Lock()
+				vp.Failed++
+				vpMu.Unlock()
+				_ = store.MarkFailed(FailRecord{VID: vid, FID: job.rec.FidPathSafe, Stage: "path", Err: err.Error()})
+				return
+			}
+		}
+
+		if cfg.DryRun {
+			fmt.Printf("DRY-RUN vid=%d fid=%s -> %s size=%d\n", ref.VolumeID, job.rec.FidPathSafe, dest, job.rec.DataSize)
+			if err := store.MarkSuccess(vid, job.rec.FidPathSafe); err != nil {
+				failed.Add(1)
+				return
+			}
+			uploaded.Add(1)
+			migratedLimit.Add(1)
+			vpMu.Lock()
+			vp.Uploaded++
+			vp.LastFID = job.rec.FidPathSafe
+			vpMu.Unlock()
+			return
+		}
+
+		dig := Digest{}
+		if cfg.VerifyMode == VerifyMD5 {
+			dig = DigestOf(job.rec.Data)
+		} else {
+			dig = Digest{Size: job.rec.DataSize}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout(job.rec.DataSize))
+		var exists bool
+		var remoteSize int64
+		var remoteETag string
+		if cfg.VerifyMode == VerifyCRC {
+			exists, remoteSize, remoteETag, err = dst.Head(ctx, dest)
+		} else {
+			exists, remoteSize, err = dst.Stat(ctx, dest)
+		}
+		cancel()
+		if err != nil {
+			glog.V(1).Infof("exists check %s: %v", dest, err)
+		} else if exists {
+			skipOK := true
+			if cfg.VerifyMode.AtLeast(VerifySize) && remoteSize >= 0 && remoteSize != dig.Size {
+				skipOK = false
+			}
+			if skipOK && cfg.VerifyMode == VerifyCRC {
+				want := NeedleCRCHex(job.rec.Checksum)
+				if remoteETag == "" || remoteETag != want {
+					skipOK = false
+				}
+			}
+			if skipOK && cfg.VerifyMode == VerifyMD5 {
+				if !dig.Has {
+					dig = DigestOf(job.rec.Data)
+				}
+				ctx, cancel = context.WithTimeout(context.Background(), uploadTimeout(job.rec.DataSize))
+				body, derr := dst.Get(ctx, dest)
+				cancel()
+				if derr != nil || DigestOf(body).MD5 != dig.MD5 {
+					skipOK = false
+				}
+			}
+			if skipOK {
+				if err := store.MarkSuccess(vid, job.rec.FidPathSafe); err != nil {
+					failed.Add(1)
+					return
+				}
+				skippedN.Add(1)
+				verified.Add(1)
+				vpMu.Lock()
+				vp.Skipped++
+				vp.LastFID = job.rec.FidPathSafe
+				vpMu.Unlock()
+				return
+			}
+		}
+
+		if cfg.VerifyMode == VerifyMD5 && !dig.Has {
+			dig = DigestOf(job.rec.Data)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), uploadTimeout(job.rec.DataSize))
+		err = dst.Put(ctx, dest, job.rec.Name, job.rec.Mime, job.rec.Data, dig, cfg.Retries)
+		cancel()
+		if err != nil {
+			failed.Add(1)
+			vpMu.Lock()
+			vp.Failed++
+			vpMu.Unlock()
+			_ = store.MarkFailed(FailRecord{
+				VID: vid, FID: job.rec.FidPathSafe, Path: dest, Stage: "upload",
+				Err: err.Error(), Retry: cfg.Retries,
+			})
+			return
+		}
+
+		if cfg.VerifyMode.AtLeast(VerifyExists) {
+			ctx, cancel = context.WithTimeout(context.Background(), uploadTimeout(job.rec.DataSize))
+			var okExists bool
+			var gotSize int64
+			var gotETag string
+			var verr error
+			if cfg.VerifyMode == VerifyCRC {
+				okExists, gotSize, gotETag, verr = dst.Head(ctx, dest)
+			} else {
+				okExists, gotSize, verr = dst.Stat(ctx, dest)
+			}
+			cancel()
+			if verr != nil || !okExists {
+				msg := fmt.Sprintf("verify exists failed exists=%v err=%v", okExists, verr)
+				failed.Add(1)
+				vpMu.Lock()
+				vp.Failed++
+				vpMu.Unlock()
+				_ = store.MarkFailed(FailRecord{VID: vid, FID: job.rec.FidPathSafe, Path: dest, Stage: "verify", Err: msg})
+				return
+			}
+			if cfg.VerifyMode.AtLeast(VerifySize) && gotSize >= 0 && gotSize != dig.Size {
+				msg := fmt.Sprintf("verify size failed size=%d want=%d", gotSize, dig.Size)
+				failed.Add(1)
+				vpMu.Lock()
+				vp.Failed++
+				vpMu.Unlock()
+				_ = store.MarkFailed(FailRecord{VID: vid, FID: job.rec.FidPathSafe, Path: dest, Stage: "verify", Err: msg})
+				return
+			}
+			if cfg.VerifyMode == VerifyCRC {
+				want := NeedleCRCHex(job.rec.Checksum)
+				if gotETag == "" || gotETag != want {
+					msg := FormatCRCMismatch(want, gotETag)
+					failed.Add(1)
+					vpMu.Lock()
+					vp.Failed++
+					vpMu.Unlock()
+					_ = store.MarkFailed(FailRecord{VID: vid, FID: job.rec.FidPathSafe, Path: dest, Stage: "verify", Err: msg})
+					return
+				}
+			}
+			if cfg.VerifyMode == VerifyMD5 {
+				ctx, cancel = context.WithTimeout(context.Background(), uploadTimeout(job.rec.DataSize))
+				body, derr := dst.Get(ctx, dest)
+				cancel()
+				if derr != nil {
+					failed.Add(1)
+					vpMu.Lock()
+					vp.Failed++
+					vpMu.Unlock()
+					_ = store.MarkFailed(FailRecord{VID: vid, FID: job.rec.FidPathSafe, Path: dest, Stage: "verify", Err: derr.Error()})
+					return
+				}
+				dst := DigestOf(body)
+				if dst.MD5 != dig.MD5 {
+					failed.Add(1)
+					vpMu.Lock()
+					vp.Failed++
+					vpMu.Unlock()
+					_ = store.MarkFailed(FailRecord{
+						VID: vid, FID: job.rec.FidPathSafe, Path: dest, Stage: "verify",
+						Err: FormatMD5Mismatch(dig, dst),
+					})
+					return
+				}
+			}
+			verified.Add(1)
+		}
+
+		if err := store.MarkSuccess(vid, job.rec.FidPathSafe); err != nil {
+			failed.Add(1)
+			return
+		}
+		uploaded.Add(1)
+		bytesUp.Add(job.rec.DataSize)
+		migratedLimit.Add(1)
+		vpMu.Lock()
+		vp.Uploaded++
+		vp.Bytes += job.rec.DataSize
+		vp.LastFID = job.rec.FidPathSafe
+		vpMu.Unlock()
+		glog.V(1).Infof("migrated %s -> %s (%d bytes)", job.rec.FidPathSafe, dest, job.rec.DataSize)
+	}
+
+	for i := 0; i < cfg.Workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				process(job)
+			}
+		}()
+	}
+
+	err := ScanVolume(ref, vp.IdxCursor, cfg.Newer, cfg.HasNewer, cfg.Decompress,
+		func(idxPos uint64, rec *NeedleRecord) error {
+			if stopScan.Load() {
+				return ioEOF
+			}
+			if cfg.Limit > 0 && migratedLimit.Load() >= int64(cfg.Limit) {
+				stopScan.Store(true)
+				return ioEOF
+			}
+			var jobRec *NeedleRecord
+			if rec != nil {
+				cp := *rec
+				cp.Data = append([]byte(nil), rec.Data...)
+				jobRec = &cp
+			}
+			jobs <- migrateJob{idxPos: idxPos, rec: jobRec}
+			return nil
+		})
+	if err != nil && err != ioEOF {
+		scanErr = err
+	}
+	close(jobs)
+	wg.Wait()
+	close(doneIdx)
+	<-commitDone
+
+	if scanErr != nil {
+		return fmt.Errorf("scan volume %d: %w", ref.VolumeID, scanErr)
+	}
+	return nil
+}
+
 var ioEOF = fmt.Errorf("migrate limit reached")
 
 func uploadTimeout(size int64) time.Duration {
-	// 60s base + ~1s per MB
 	d := 60*time.Second + time.Duration(size/1_000_000)*time.Second
 	if d < 60*time.Second {
 		d = 60 * time.Second
